@@ -7,6 +7,8 @@
 #include "ofxsMultiThread.h"
 #include "ofxsProcessing.h"
 
+#include "ReframeOpenCL.h"
+
 #define kPluginName "DJI Reframe"
 #define kPluginGrouping "DJI"
 #define kPluginIdentifier "com.pano360.reframe"
@@ -135,14 +137,14 @@ bool invert(const Mat4 &src, Mat4 &out) {
   return true;
 }
 
-// Source is bottom-up (OFX) while the reference kernels assume a top-down
-// equirect texture, so v is flipped at sample time rather than in the maths.
+// Matches the reference kernel exactly: row 0 is v=0. OFX buffers are bottom-up,
+// which already puts the pano's north pole at v=1, so no flip belongs here.
 void sampleBilinear(const float *src, int srcW, int srcH, int srcRowFloats,
                     float u, float v, float *out) {
   u = std::clamp(u, 0.0f, 1.0f);
   v = std::clamp(v, 0.0f, 1.0f);
   const float fx = u * static_cast<float>(srcW - 1);
-  const float fy = (1.0f - v) * static_cast<float>(srcH - 1);
+  const float fy = v * static_cast<float>(srcH - 1);
   const int x0 = static_cast<int>(std::floor(fx));
   const int y0 = static_cast<int>(std::floor(fy));
   const int x1 = std::min(x0 + 1, srcW - 1);
@@ -317,7 +319,7 @@ class ReframeProcessor : public OFX::ImageProcessor {
       phi -= 2.0f * kPi;
 
     u = phi / (2.0f * kPi);
-    v = 1.0f - theta / kPi;
+    v = theta / kPi;
     return true;
   }
 
@@ -350,6 +352,9 @@ class ReframePlugin : public OFX::ImageEffect {
     std::unique_ptr<OFX::Image> src(srcClip_->fetchImage(args.time));
     if (!dst || !src) return;
 
+    if (args.isEnabledOpenCLRender && renderOpenCL(args, src.get(), dst.get()))
+      return;
+
     if (dst->getPixelDepth() != OFX::eBitDepthFloat ||
         src->getPixelDepth() != OFX::eBitDepthFloat ||
         dst->getPixelComponents() != OFX::ePixelComponentRGBA ||
@@ -376,6 +381,32 @@ class ReframePlugin : public OFX::ImageEffect {
   }
 
  private:
+  bool renderOpenCL(const OFX::RenderArguments &args, OFX::Image *src,
+                    OFX::Image *dst) const {
+    const OfxRectI sb = src->getBounds();
+    const OfxRectI db = dst->getBounds();
+    const int srcW = sb.x2 - sb.x1, srcH = sb.y2 - sb.y1;
+    const int dstW = db.x2 - db.x1, dstH = db.y2 - db.y1;
+    if (srcW < 2 || srcH < 2 || dstW < 1 || dstH < 1) return false;
+
+    const RenderParams p = buildParams(args);
+    ReframeCLParams cl{};
+    std::memcpy(cl.invMVP, p.invMVP.m, sizeof(cl.invMVP));
+    std::memcpy(cl.rot3, p.rot3, sizeof(cl.rot3));
+    std::memcpy(cl.borderRGB, p.borderRGB, sizeof(cl.borderRGB));
+    cl.viewport[0] = 0.0f;
+    cl.viewport[1] = 0.0f;
+    cl.viewport[2] = static_cast<float>(dstW);
+    cl.viewport[3] = static_cast<float>(dstH);
+    cl.vScale = p.vScale;
+    cl.vOffset = p.vOffset;
+    cl.borderMode = static_cast<int>(p.borderMode);
+    cl.useCylinder = p.projection == kProjDewarp ? 1 : 0;
+
+    return reframeRunOpenCL(args.pOpenCLCmdQ, src->getPixelData(),
+                            dst->getPixelData(), srcW, srcH, dstW, dstH, cl);
+  }
+
   RenderParams buildParams(const OFX::RenderArguments &args) const {
     RenderParams p{};
     int projIdx = 0, borderIdx = 0;
@@ -483,6 +514,9 @@ class ReframeFactory : public OFX::PluginFactoryHelper<ReframeFactory> {
     desc.addSupportedContext(OFX::eContextFilter);
     desc.addSupportedContext(OFX::eContextGeneral);
     desc.addSupportedBitDepth(OFX::eBitDepthFloat);
+    // Resolve skips CPU-only plugins on Linux with "not supported on this
+    // platform", so GPU render support has to be advertised here.
+    desc.setSupportsOpenCLBuffersRender(true);
     desc.setSingleInstance(false);
     desc.setHostFrameThreading(false);
     desc.setSupportsMultiResolution(true);

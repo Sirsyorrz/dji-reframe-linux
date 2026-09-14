@@ -1,2 +1,3 @@
 build/
 vendor/
+src/reframe_kernel.inc
