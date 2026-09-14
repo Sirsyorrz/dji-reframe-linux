@@ -209,6 +209,7 @@ constexpr int kNumResolutions =
 struct RenderParams {
   Mat4 invMVP;
   float rot3[9];
+  float viewport[4];  // x, y, w, h in pixels, relative to the output bounds
   Projection projection;
   BorderMode borderMode;
   float borderRGB[3];
@@ -235,21 +236,27 @@ class ReframeProcessor : public OFX::ImageProcessor {
     if (srcW < 2 || srcH < 2 || srcBase == nullptr) return;
 
     const OfxRectI dstBounds = _dstImg->getBounds();
-    const float dstW = static_cast<float>(dstBounds.x2 - dstBounds.x1);
-    const float dstH = static_cast<float>(dstBounds.y2 - dstBounds.y1);
+    const float vpX = params_.viewport[0], vpY = params_.viewport[1];
+    const float vpW = params_.viewport[2], vpH = params_.viewport[3];
+    if (vpW <= 0.0f || vpH <= 0.0f) return;
 
     for (int y = window.y1; y < window.y2; ++y) {
       if (_effect.abort()) break;
       float *dst = static_cast<float *>(_dstImg->getPixelAddress(window.x1, y));
       if (dst == nullptr) continue;
 
+      const float fy = static_cast<float>(y - dstBounds.y1) + 0.5f;
       // NDC y is already bottom-up in OFX, matching the kernel's Y-flip.
-      const float ndcY =
-          ((static_cast<float>(y - dstBounds.y1) + 0.5f) / dstH) * 2.0f - 1.0f;
+      const float ndcY = ((fy - vpY) / vpH) * 2.0f - 1.0f;
+      const bool rowInside = fy >= vpY && fy < vpY + vpH;
 
       for (int x = window.x1; x < window.x2; ++x, dst += 4) {
-        const float ndcX =
-            ((static_cast<float>(x - dstBounds.x1) + 0.5f) / dstW) * 2.0f - 1.0f;
+        const float fx = static_cast<float>(x - dstBounds.x1) + 0.5f;
+        if (!rowInside || fx < vpX || fx >= vpX + vpW) {
+          writeBorder(dst);
+          continue;
+        }
+        const float ndcX = ((fx - vpX) / vpW) * 2.0f - 1.0f;
 
         bool hit = false;
         float u = 0.0f, v = 0.0f;
@@ -379,17 +386,6 @@ class ReframePlugin : public OFX::ImageEffect {
     syncCustomEnabled();
   }
 
-  bool getRegionOfDefinition(const OFX::RegionOfDefinitionArguments &args,
-                             OfxRectD &rod) override {
-    int w = 0, h = 0;
-    if (!outputSize(args.time, w, h)) return false;
-    rod.x1 = 0.0;
-    rod.y1 = 0.0;
-    rod.x2 = w * args.renderScale.x;
-    rod.y2 = h * args.renderScale.y;
-    return true;
-  }
-
   void getClipPreferences(OFX::ClipPreferencesSetter &prefs) override {
     prefs.setOutputPremultiplication(OFX::eImageUnPreMultiplied);
   }
@@ -422,7 +418,7 @@ class ReframePlugin : public OFX::ImageEffect {
     proc.setDstImg(dst.get());
     proc.setSrcImg(src.get());
     proc.setRenderWindow(args.renderWindow);
-    proc.setParams(buildParams(args));
+    proc.setParams(buildParams(args, dst->getBounds()));
     proc.process();
   }
 
@@ -474,15 +470,12 @@ class ReframePlugin : public OFX::ImageEffect {
     const int dstW = db.x2 - db.x1, dstH = db.y2 - db.y1;
     if (srcW < 2 || srcH < 2 || dstW < 1 || dstH < 1) return false;
 
-    const RenderParams p = buildParams(args);
+    const RenderParams p = buildParams(args, db);
     ReframeCLParams cl{};
     std::memcpy(cl.invMVP, p.invMVP.m, sizeof(cl.invMVP));
     std::memcpy(cl.rot3, p.rot3, sizeof(cl.rot3));
     std::memcpy(cl.borderRGB, p.borderRGB, sizeof(cl.borderRGB));
-    cl.viewport[0] = 0.0f;
-    cl.viewport[1] = 0.0f;
-    cl.viewport[2] = static_cast<float>(dstW);
-    cl.viewport[3] = static_cast<float>(dstH);
+    std::memcpy(cl.viewport, p.viewport, sizeof(cl.viewport));
     cl.vScale = p.vScale;
     cl.vOffset = p.vOffset;
     cl.borderMode = static_cast<int>(p.borderMode);
@@ -492,7 +485,8 @@ class ReframePlugin : public OFX::ImageEffect {
                             dst->getPixelData(), srcW, srcH, dstW, dstH, cl);
   }
 
-  RenderParams buildParams(const OFX::RenderArguments &args) const {
+  RenderParams buildParams(const OFX::RenderArguments &args,
+                           const OfxRectI &dstBounds) const {
     RenderParams p{};
     int projIdx = 0, borderIdx = 0;
     projection_->getValueAtTime(args.time, projIdx);
@@ -550,12 +544,25 @@ class ReframePlugin : public OFX::ImageEffect {
         break;
     }
 
-    const OfxRectI win = args.renderWindow;
-    float aspect = 1.0f;
-    if (win.y2 > win.y1)
-      aspect = static_cast<float>(win.x2 - win.x1) /
-               static_cast<float>(win.y2 - win.y1);
-    aspect *= static_cast<float>(args.renderScale.x / args.renderScale.y);
+    // Resolve pins OFX output to the timeline size, so the Resolution param
+    // letterboxes a viewport inside the frame instead of resizing it.
+    const float dstW = static_cast<float>(dstBounds.x2 - dstBounds.x1);
+    const float dstH = static_cast<float>(dstBounds.y2 - dstBounds.y1);
+    float vpW = dstW, vpH = dstH;
+    int targetW = 0, targetH = 0;
+    if (outputSize(args.time, targetW, targetH) && targetW > 0 && targetH > 0) {
+      const float target = static_cast<float>(targetW) / static_cast<float>(targetH);
+      if (dstW / dstH > target)
+        vpW = dstH * target;
+      else
+        vpH = dstW / target;
+    }
+    p.viewport[0] = (dstW - vpW) * 0.5f;
+    p.viewport[1] = (dstH - vpH) * 0.5f;
+    p.viewport[2] = vpW;
+    p.viewport[3] = vpH;
+
+    const float aspect = vpH > 0.0f ? vpW / vpH : 1.0f;
 
     const float fovY = 2.0f * std::atan(std::tan(effectiveFov * deg * 0.5f) /
                                         std::max(aspect, 1e-3f));
