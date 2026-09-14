@@ -22,8 +22,8 @@ if test (count $argv) -lt 1
     echo "  -c dnxhr|prores     intermediate codec (default dnxhr)"
     echo "  -f FOV              fisheye field of view, default 196"
     echo "  -y/-t/-r DEGREES    yaw/tilt/roll baked into the stitch so the clip"
-    echo "                      lands level (default yaw 180). Any value works,"
-    echo "                      270 and -90 mean the same thing."
+    echo "                      lands level (default 0, facing away from the"
+    echo "                      helmet). Any value works, 270 and -90 are equal."
     echo "  -g                  write a labelled grid of orientations to pick from"
     echo "  -s SECONDS          start offset"
     echo "  -d SECONDS          duration"
@@ -34,7 +34,7 @@ end
 
 set -l ih_fov (set -q _flag_fov; and echo $_flag_fov; or echo 196)
 # Baked in so the Source File controls in the OFX plugin can stay at zero.
-set -l yaw (_wrap (set -q _flag_yaw; and echo $_flag_yaw; or echo 180))
+set -l yaw (_wrap (set -q _flag_yaw; and echo $_flag_yaw; or echo 0))
 set -l tilt (_wrap (set -q _flag_tilt; and echo $_flag_tilt; or echo 0))
 set -l roll (_wrap (set -q _flag_roll; and echo $_flag_roll; or echo 0))
 set -l quality (set -q _flag_quality; and echo $_flag_quality; or echo high)
