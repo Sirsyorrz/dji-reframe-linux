@@ -3,7 +3,10 @@
 #include <cstring>
 #include <vector>
 
+#include <GL/gl.h>
+
 #include "ofxsImageEffect.h"
+#include "ofxsInteract.h"
 #include "ofxsMultiThread.h"
 #include "ofxsProcessing.h"
 
@@ -180,6 +183,29 @@ enum BorderMode {
   kBorderMirror,
 };
 
+struct ResolutionPreset {
+  const char *label;
+  int w, h;
+};
+
+// Labels and order taken verbatim from the original plugin's string table.
+const ResolutionPreset kResolutions[] = {
+    {"Source Image", 0, 0},
+    {"1080p 16:9(1920*1080)", 1920, 1080},
+    {"1080p 9:16(1080*1920)", 1080, 1920},
+    {"1080p 1:1 (1080*1080)", 1080, 1080},
+    {"1080p 2.35:1(2538*1080)", 2538, 1080},
+    {"1080p 4:3 (1440*1080)", 1440, 1080},
+    {"1080p 3:4(1080*1440)", 1080, 1440},
+    {"4k 16:9(3840*2160)", 3840, 2160},
+    {"4k 9:16(2160*3840)", 2160, 3840},
+    {"4k 1:1(2160*2160)", 2160, 2160},
+    {"4k 2.35:1(3840*1634)", 3840, 1634},
+    {"Custom", -1, -1},
+};
+constexpr int kNumResolutions =
+    static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0]));
+
 struct RenderParams {
   Mat4 invMVP;
   float rot3[9];
@@ -333,19 +359,49 @@ class ReframePlugin : public OFX::ImageEffect {
     dstClip_ = fetchClip(kOfxImageEffectOutputClipName);
     srcClip_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
 
-    projection_ = fetchChoiceParam("projection");
-    pan_ = fetchDoubleParam("pan");
-    tilt_ = fetchDoubleParam("tilt");
-    roll_ = fetchDoubleParam("roll");
-    fov_ = fetchDoubleParam("fov");
-    distortion_ = fetchDoubleParam("distortion");
-    srcYaw_ = fetchDoubleParam("srcYaw");
-    srcPitch_ = fetchDoubleParam("srcPitch");
-    srcRoll_ = fetchDoubleParam("srcRoll");
-    borderMode_ = fetchChoiceParam("borderMode");
-    borderColor_ = fetchRGBParam("borderColor");
-    reset_ = fetchPushButtonParam("reset");
+    resolution_ = fetchChoiceParam("resolution");
+    customWidth_ = fetchIntParam("custom_width");
+    customHeight_ = fetchIntParam("custom_height");
+    projection_ = fetchChoiceParam("camera_projection_type");
+    pan_ = fetchDoubleParam("camera_pan");
+    tilt_ = fetchDoubleParam("camera_tilt");
+    roll_ = fetchDoubleParam("camera_rotate");
+    fov_ = fetchDoubleParam("camera_fov_control");
+    distortion_ = fetchDoubleParam("camera_distortion_control");
+    srcYaw_ = fetchDoubleParam("source_file_yaw");
+    srcPitch_ = fetchDoubleParam("source_file_pitch");
+    srcRoll_ = fetchDoubleParam("source_file_roll");
+    borderMode_ = fetchChoiceParam("border_mode");
+    borderColor_ = fetchRGBParam("border_color");
+    overlayColor_ = fetchRGBParam("overlay_color");
+    reset_ = fetchPushButtonParam("reset_button");
+
+    syncCustomEnabled();
   }
+
+  bool getRegionOfDefinition(const OFX::RegionOfDefinitionArguments &args,
+                             OfxRectD &rod) override {
+    int w = 0, h = 0;
+    if (!outputSize(args.time, w, h)) return false;
+    rod.x1 = 0.0;
+    rod.y1 = 0.0;
+    rod.x2 = w * args.renderScale.x;
+    rod.y2 = h * args.renderScale.y;
+    return true;
+  }
+
+  void getClipPreferences(OFX::ClipPreferencesSetter &prefs) override {
+    prefs.setOutputPremultiplication(OFX::eImageUnPreMultiplied);
+  }
+
+  OfxRectD getRegionOfDefinitionForOverlay(double time) const {
+    return dstClip_->getRegionOfDefinition(time);
+  }
+
+  OFX::RGBParam *overlayColorParam() const { return overlayColor_; }
+  OFX::DoubleParam *panParam() const { return pan_; }
+  OFX::DoubleParam *tiltParam() const { return tilt_; }
+  OFX::DoubleParam *fovParam() const { return fov_; }
 
   void render(const OFX::RenderArguments &args) override {
     std::unique_ptr<OFX::Image> dst(dstClip_->fetchImage(args.time));
@@ -372,7 +428,11 @@ class ReframePlugin : public OFX::ImageEffect {
 
   void changedParam(const OFX::InstanceChangedArgs &args,
                     const std::string &name) override {
-    if (name != "reset" || args.reason != OFX::eChangeUserEdit) return;
+    if (name == "resolution") {
+      syncCustomEnabled();
+      return;
+    }
+    if (name != "reset_button" || args.reason != OFX::eChangeUserEdit) return;
     pan_->setValue(0.0);
     tilt_->setValue(0.0);
     roll_->setValue(0.0);
@@ -381,6 +441,31 @@ class ReframePlugin : public OFX::ImageEffect {
   }
 
  private:
+  void syncCustomEnabled() {
+    int idx = 0;
+    resolution_->getValue(idx);
+    const bool custom = idx == kNumResolutions - 1;
+    customWidth_->setEnabled(custom);
+    customHeight_->setEnabled(custom);
+  }
+
+  bool outputSize(double time, int &w, int &h) const {
+    int idx = 0;
+    resolution_->getValueAtTime(time, idx);
+    idx = std::clamp(idx, 0, kNumResolutions - 1);
+    if (idx == 0) return false;  // Source Image: inherit the input RoD.
+    if (idx == kNumResolutions - 1) {
+      customWidth_->getValueAtTime(time, w);
+      customHeight_->getValueAtTime(time, h);
+      w = std::max(w, 1);
+      h = std::max(h, 1);
+      return true;
+    }
+    w = kResolutions[idx].w;
+    h = kResolutions[idx].h;
+    return true;
+  }
+
   bool renderOpenCL(const OFX::RenderArguments &args, OFX::Image *src,
                     OFX::Image *dst) const {
     const OfxRectI sb = src->getBounds();
@@ -495,8 +580,99 @@ class ReframePlugin : public OFX::ImageEffect {
   OFX::DoubleParam *srcRoll_ = nullptr;
   OFX::ChoiceParam *borderMode_ = nullptr;
   OFX::RGBParam *borderColor_ = nullptr;
+  OFX::RGBParam *overlayColor_ = nullptr;
   OFX::PushButtonParam *reset_ = nullptr;
+  OFX::ChoiceParam *resolution_ = nullptr;
+  OFX::IntParam *customWidth_ = nullptr;
+  OFX::IntParam *customHeight_ = nullptr;
 };
+
+// Drag in the viewer to fly the camera; guide lines mark the thirds.
+class ReframeOverlay : public OFX::OverlayInteract {
+ public:
+  ReframeOverlay(OfxInteractHandle handle, OFX::ImageEffect *effect)
+      : OFX::OverlayInteract(handle),
+        plugin_(dynamic_cast<ReframePlugin *>(effect)) {}
+
+  bool draw(const OFX::DrawArgs &args) override {
+    if (plugin_ == nullptr) return false;
+    double r = 1.0, g = 1.0, b = 1.0;
+    plugin_->overlayColorParam()->getValueAtTime(args.time, r, g, b);
+
+    const OfxRectD rod = plugin_->getRegionOfDefinitionForOverlay(args.time);
+    const double w = rod.x2 - rod.x1, h = rod.y2 - rod.y1;
+    if (w <= 0.0 || h <= 0.0) return false;
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4d(r, g, b, dragging_ ? 0.9 : 0.45);
+    glLineWidth(1.0f);
+
+    glBegin(GL_LINES);
+    for (int i = 1; i < 3; ++i) {
+      const double x = rod.x1 + w * i / 3.0;
+      glVertex2d(x, rod.y1);
+      glVertex2d(x, rod.y2);
+      const double y = rod.y1 + h * i / 3.0;
+      glVertex2d(rod.x1, y);
+      glVertex2d(rod.x2, y);
+    }
+    glEnd();
+
+    const double cx = rod.x1 + w * 0.5, cy = rod.y1 + h * 0.5;
+    const double s = 0.02 * std::min(w, h);
+    glBegin(GL_LINES);
+    glVertex2d(cx - s, cy);
+    glVertex2d(cx + s, cy);
+    glVertex2d(cx, cy - s);
+    glVertex2d(cx, cy + s);
+    glEnd();
+    glDisable(GL_BLEND);
+    return true;
+  }
+
+  bool penDown(const OFX::PenArgs &args) override {
+    if (plugin_ == nullptr) return false;
+    dragging_ = true;
+    last_ = args.penPosition;
+    return true;
+  }
+
+  bool penMotion(const OFX::PenArgs &args) override {
+    if (!dragging_ || plugin_ == nullptr) return false;
+
+    const OfxRectD rod = plugin_->getRegionOfDefinitionForOverlay(args.time);
+    const double w = rod.x2 - rod.x1, h = rod.y2 - rod.y1;
+    if (w <= 0.0 || h <= 0.0) return false;
+
+    // Scale by FOV so a drag moves the scene roughly under the cursor.
+    const double fov = plugin_->fovParam()->getValueAtTime(args.time);
+    const double dx = (args.penPosition.x - last_.x) / w * fov;
+    const double dy = (args.penPosition.y - last_.y) / h * fov;
+    last_ = args.penPosition;
+
+    plugin_->panParam()->setValue(
+        plugin_->panParam()->getValueAtTime(args.time) - dx);
+    plugin_->tiltParam()->setValue(std::clamp(
+        plugin_->tiltParam()->getValueAtTime(args.time) + dy, -90.0, 90.0));
+    return true;
+  }
+
+  bool penUp(const OFX::PenArgs & /*args*/) override {
+    if (!dragging_) return false;
+    dragging_ = false;
+    return true;
+  }
+
+ private:
+  ReframePlugin *plugin_ = nullptr;
+  bool dragging_ = false;
+  OfxPointD last_{0.0, 0.0};
+};
+
+class ReframeOverlayDescriptor
+    : public OFX::DefaultEffectOverlayDescriptor<ReframeOverlayDescriptor,
+                                                 ReframeOverlay> {};
 
 class ReframeFactory : public OFX::PluginFactoryHelper<ReframeFactory> {
  public:
@@ -508,9 +684,8 @@ class ReframeFactory : public OFX::PluginFactoryHelper<ReframeFactory> {
   void describe(OFX::ImageEffectDescriptor &desc) override {
     desc.setLabels(kPluginName, kPluginName, kPluginName);
     desc.setPluginGrouping(kPluginGrouping);
-    desc.setPluginDescription(
-        "Reframe equirectangular 360 footage to a flat view. "
-        "Expects an equirectangular (2:1) source.");
+    desc.setPluginDescription("Lets you animate a virtual camera in your 360 footage.");
+    desc.setOverlayInteractDescriptor(new ReframeOverlayDescriptor);
     desc.addSupportedContext(OFX::eContextFilter);
     desc.addSupportedContext(OFX::eContextGeneral);
     desc.addSupportedBitDepth(OFX::eBitDepthFloat);
@@ -540,96 +715,139 @@ class ReframeFactory : public OFX::PluginFactoryHelper<ReframeFactory> {
 
     OFX::PageParamDescriptor *page = desc.definePageParam("Controls");
 
+    auto group = [&](const char *name, const char *label, bool open) {
+      OFX::GroupParamDescriptor *g = desc.defineGroupParam(name);
+      g->setLabel(label);
+      g->setOpen(open);
+      page->addChild(*g);
+      return g;
+    };
+
+    OFX::GroupParamDescriptor *gRes = group("Group_Resolution", "Resolution", true);
     {
-      OFX::ChoiceParamDescriptor *p = desc.defineChoiceParam("projection");
+      OFX::ChoiceParamDescriptor *p = desc.defineChoiceParam("resolution");
+      p->setLabel("Resolution");
+      for (const ResolutionPreset &r : kResolutions) p->appendOption(r.label);
+      p->setDefault(0);
+      p->setAnimates(false);
+      p->setParent(*gRes);
+    }
+    {
+      OFX::IntParamDescriptor *p = desc.defineIntParam("custom_width");
+      p->setLabel("Custom Width");
+      p->setHint("Custom output width");
+      p->setDefault(7680);
+      p->setRange(1, 16384);
+      p->setDisplayRange(1, 16384);
+      p->setAnimates(false);
+      p->setParent(*gRes);
+    }
+    {
+      OFX::IntParamDescriptor *p = desc.defineIntParam("custom_height");
+      p->setLabel("Custom Height");
+      p->setHint("Custom output height");
+      p->setDefault(3840);
+      p->setRange(1, 16384);
+      p->setDisplayRange(1, 16384);
+      p->setAnimates(false);
+      p->setParent(*gRes);
+    }
+
+    OFX::GroupParamDescriptor *gCam =
+        group("Group_Camera", "Camera Operation", true);
+    {
+      OFX::ChoiceParamDescriptor *p = desc.defineChoiceParam("camera_projection_type");
       p->setLabel("Projection");
       p->appendOption("Wide");
-      p->appendOption("Crystal Ball");
-      p->appendOption("Tiny Planet");
-      p->appendOption("Ultra Wide");
+      p->appendOption("CrystalBall");
+      p->appendOption("TinyPlanet");
+      p->appendOption("UltraWide");
       p->appendOption("Dewarp");
       p->setDefault(kProjWide);
       p->setAnimates(true);
-      page->addChild(*p);
+      p->setParent(*gCam);
     }
 
-    auto angle = [&](const char *name, const char *label, double def, double lo,
-                     double hi) {
+    auto angle = [&](const char *name, const char *label, double lo, double hi,
+                     OFX::GroupParamDescriptor *g) {
       OFX::DoubleParamDescriptor *p = desc.defineDoubleParam(name);
       p->setLabel(label);
       p->setDoubleType(OFX::eDoubleTypeAngle);
-      p->setDefault(def);
+      p->setDefault(0.0);
       p->setRange(lo, hi);
       p->setDisplayRange(lo, hi);
       p->setAnimates(true);
-      page->addChild(*p);
+      p->setParent(*g);
     };
 
-    angle("pan", "Pan", 0.0, -3600.0, 3600.0);
-    angle("tilt", "Tilt", 0.0, -180.0, 180.0);
-    angle("roll", "Roll", 0.0, -180.0, 180.0);
+    angle("camera_pan", "Pan", -3600.0, 3600.0, gCam);
+    angle("camera_tilt", "Tilt", -90.0, 90.0, gCam);
+    angle("camera_rotate", "Rotate", -180.0, 180.0, gCam);
 
     {
-      OFX::DoubleParamDescriptor *p = desc.defineDoubleParam("fov");
-      p->setLabel("FOV");
+      OFX::DoubleParamDescriptor *p = desc.defineDoubleParam("camera_fov_control");
+      p->setLabel("FOV Control");
       p->setDefault(90.0);
       p->setRange(5.0, 170.0);
       p->setDisplayRange(5.0, 170.0);
       p->setAnimates(true);
-      page->addChild(*p);
+      p->setParent(*gCam);
     }
     {
-      OFX::DoubleParamDescriptor *p = desc.defineDoubleParam("distortion");
-      p->setLabel("Distortion");
+      OFX::DoubleParamDescriptor *p =
+          desc.defineDoubleParam("camera_distortion_control");
+      p->setLabel("Distortion Control");
       p->setDefault(0.0);
       p->setRange(-1.0, 1.0);
       p->setDisplayRange(-1.0, 1.0);
       p->setAnimates(true);
-      page->addChild(*p);
+      p->setParent(*gCam);
+    }
+    {
+      OFX::PushButtonParamDescriptor *p = desc.definePushButtonParam("reset_button");
+      p->setLabel("Reset");
+      p->setHint("Reset camera parameters");
+      p->setParent(*gCam);
     }
 
-    {
-      OFX::GroupParamDescriptor *g = desc.defineGroupParam("sourceOrientation");
-      g->setLabel("Source Orientation");
-      g->setOpen(false);
-      page->addChild(*g);
+    OFX::GroupParamDescriptor *gSrc = group("Group_SourceFile", "Source File", true);
+    angle("source_file_yaw", "Pan", -180.0, 180.0, gSrc);
+    angle("source_file_pitch", "Tilt", -180.0, 180.0, gSrc);
+    angle("source_file_roll", "Rotate", -180.0, 180.0, gSrc);
 
-      auto srcAngle = [&](const char *name, const char *label) {
-        OFX::DoubleParamDescriptor *p = desc.defineDoubleParam(name);
-        p->setLabel(label);
-        p->setDoubleType(OFX::eDoubleTypeAngle);
-        p->setDefault(0.0);
-        p->setRange(-180.0, 180.0);
-        p->setDisplayRange(-180.0, 180.0);
-        p->setAnimates(true);
-        p->setParent(*g);
-      };
-      srcAngle("srcYaw", "Source Yaw");
-      srcAngle("srcPitch", "Source Pitch");
-      srcAngle("srcRoll", "Source Roll");
-    }
-
+    OFX::GroupParamDescriptor *gAdv = group("Group_Advanced", "Advanced", true);
     {
-      OFX::ChoiceParamDescriptor *p = desc.defineChoiceParam("borderMode");
-      p->setLabel("Border");
+      OFX::GroupParamDescriptor *gBg = desc.defineGroupParam("Group_Background");
+      gBg->setLabel("Background");
+      gBg->setOpen(true);
+      gBg->setParent(*gAdv);
+
+      OFX::ChoiceParamDescriptor *p = desc.defineChoiceParam("border_mode");
+      p->setLabel("Border Mode");
       p->appendOption("Transparent");
       p->appendOption("Color");
-      p->appendOption("Mirror / Extend");
+      p->appendOption("Mirror/Extend");
       p->setDefault(kBorderTransparent);
       p->setAnimates(false);
-      page->addChild(*p);
+      p->setParent(*gBg);
+
+      OFX::RGBParamDescriptor *c = desc.defineRGBParam("border_color");
+      c->setLabel("Border Color");
+      c->setDefault(0.0, 0.0, 0.0);
+      c->setAnimates(true);
+      c->setParent(*gBg);
     }
     {
-      OFX::RGBParamDescriptor *p = desc.defineRGBParam("borderColor");
-      p->setLabel("Border Color");
-      p->setDefault(0.0, 0.0, 0.0);
-      p->setAnimates(true);
-      page->addChild(*p);
-    }
-    {
-      OFX::PushButtonParamDescriptor *p = desc.definePushButtonParam("reset");
-      p->setLabel("Reset View");
-      page->addChild(*p);
+      OFX::GroupParamDescriptor *gOv = desc.defineGroupParam("Group_OverlayColor");
+      gOv->setLabel("Guide Lines");
+      gOv->setOpen(true);
+      gOv->setParent(*gAdv);
+
+      OFX::RGBParamDescriptor *c = desc.defineRGBParam("overlay_color");
+      c->setLabel("Guide Line Color");
+      c->setDefault(0.8, 0.8, 0.8);
+      c->setAnimates(true);
+      c->setParent(*gOv);
     }
   }
 

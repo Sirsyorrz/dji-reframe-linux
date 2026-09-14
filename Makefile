@@ -9,7 +9,7 @@ CL_FLAGS := $(if $(CL_INC),-I$(patsubst %/CL/cl.h,%,$(CL_INC)))
 CXXFLAGS := -std=c++17 -O3 -ffast-math -fPIC -Wall -Wextra -fvisibility=hidden \
             -I$(OFX_ROOT)/include -I$(OFX_ROOT)/Support/include -Isrc $(CL_FLAGS) \
             -DOFX_EXTENSIONS_NUKE -DOFX_EXTENSIONS_RESOLVE
-LDFLAGS := -shared -lpthread -lOpenCL
+LDFLAGS := -shared -lpthread -lOpenCL -lGL
 
 SUPPORT_SRC := $(wildcard $(OFX_ROOT)/Support/Library/ofxs*.cpp)
 SRC := src/DJIReframe.cpp src/ReframeOpenCL.cpp $(SUPPORT_SRC)
