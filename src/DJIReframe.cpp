@@ -11,6 +11,7 @@
 #include "ofxsProcessing.h"
 
 #include "ReframeOpenCL.h"
+#include "reframe_math.h"
 
 #define kPluginName "DJI Reframe"
 #define kPluginGrouping "DJI"
@@ -20,125 +21,8 @@
 
 namespace {
 
-constexpr float kPi = 3.14159265358979323846f;
+using namespace reframe;
 
-struct Vec3 {
-  float x, y, z;
-};
-
-struct Mat4 {
-  float m[16];  // column-major, m[col*4 + row]
-};
-
-Mat4 identity() {
-  Mat4 r{};
-  r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
-  return r;
-}
-
-Mat4 multiply(const Mat4 &a, const Mat4 &b) {
-  Mat4 r{};
-  for (int c = 0; c < 4; ++c)
-    for (int row = 0; row < 4; ++row) {
-      float s = 0.0f;
-      for (int k = 0; k < 4; ++k) s += a.m[k * 4 + row] * b.m[c * 4 + k];
-      r.m[c * 4 + row] = s;
-    }
-  return r;
-}
-
-Mat4 perspective(float fovYRad, float aspect, float zn, float zf) {
-  Mat4 r{};
-  const float f = 1.0f / std::tan(fovYRad * 0.5f);
-  r.m[0] = f / aspect;
-  r.m[5] = f;
-  r.m[10] = (zf + zn) / (zn - zf);
-  r.m[11] = -1.0f;
-  r.m[14] = (2.0f * zf * zn) / (zn - zf);
-  return r;
-}
-
-Mat4 rotationX(float a) {
-  Mat4 r = identity();
-  const float c = std::cos(a), s = std::sin(a);
-  r.m[5] = c;
-  r.m[6] = s;
-  r.m[9] = -s;
-  r.m[10] = c;
-  return r;
-}
-
-Mat4 rotationY(float a) {
-  Mat4 r = identity();
-  const float c = std::cos(a), s = std::sin(a);
-  r.m[0] = c;
-  r.m[2] = -s;
-  r.m[8] = s;
-  r.m[10] = c;
-  return r;
-}
-
-Mat4 rotationZ(float a) {
-  Mat4 r = identity();
-  const float c = std::cos(a), s = std::sin(a);
-  r.m[0] = c;
-  r.m[1] = s;
-  r.m[4] = -s;
-  r.m[5] = c;
-  return r;
-}
-
-Mat4 translation(float x, float y, float z) {
-  Mat4 r = identity();
-  r.m[12] = x;
-  r.m[13] = y;
-  r.m[14] = z;
-  return r;
-}
-
-bool invert(const Mat4 &src, Mat4 &out) {
-  const float *m = src.m;
-  float inv[16];
-
-  inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] +
-           m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
-  inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] -
-           m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
-  inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] +
-           m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
-  inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] -
-            m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
-  inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] -
-           m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
-  inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] +
-           m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
-  inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] -
-           m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
-  inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] +
-            m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
-  inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] +
-           m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
-  inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] -
-           m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
-  inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] +
-            m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
-  inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] -
-            m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
-  inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] -
-           m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
-  inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] +
-           m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
-  inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] -
-            m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
-  inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] +
-            m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
-
-  float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
-  if (std::fabs(det) < 1e-20f) return false;
-  det = 1.0f / det;
-  for (int i = 0; i < 16; ++i) out.m[i] = inv[i] * det;
-  return true;
-}
 
 // Matches the reference kernel exactly: row 0 is v=0. OFX buffers are bottom-up,
 // which already puts the pano's north pole at v=1, so no flip belongs here.
@@ -288,45 +172,7 @@ class ReframeProcessor : public OFX::ImageProcessor {
   }
 
   bool sphereUV(float ndcX, float ndcY, float &u, float &v) const {
-    const float *M = params_.invMVP.m;
-    auto unproject = [&](float z, Vec3 &out) {
-      const float px = M[0] * ndcX + M[4] * ndcY + M[8] * z + M[12];
-      const float py = M[1] * ndcX + M[5] * ndcY + M[9] * z + M[13];
-      const float pz = M[2] * ndcX + M[6] * ndcY + M[10] * z + M[14];
-      const float pw = M[3] * ndcX + M[7] * ndcY + M[11] * z + M[15];
-      if (std::fabs(pw) < 1e-20f) return false;
-      out = {px / pw, py / pw, pz / pw};
-      return true;
-    };
-
-    Vec3 nearPt, farPt;
-    if (!unproject(-1.0f, nearPt) || !unproject(1.0f, farPt)) return false;
-
-    Vec3 dir{farPt.x - nearPt.x, farPt.y - nearPt.y, farPt.z - nearPt.z};
-    const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-    if (len < 1e-10f) return false;
-    dir.x /= len;
-    dir.y /= len;
-    dir.z /= len;
-
-    const float b = 2.0f * (nearPt.x * dir.x + nearPt.y * dir.y + nearPt.z * dir.z);
-    const float c =
-        nearPt.x * nearPt.x + nearPt.y * nearPt.y + nearPt.z * nearPt.z - 1.0f;
-    const float disc = b * b - 4.0f * c;
-    if (disc < 0.0f) return false;
-
-    const float sq = std::sqrt(disc);
-    float t = (-b - sq) * 0.5f;
-    if (t < 0.0f) t = (-b + sq) * 0.5f;
-    if (t < 0.0f) return false;
-
-    const Vec3 hit{nearPt.x + t * dir.x, nearPt.y + t * dir.y, nearPt.z + t * dir.z};
-    const float theta = std::acos(std::clamp(hit.y, -1.0f, 1.0f));
-    float phi = std::atan2(hit.x, hit.z);
-    if (phi < 0.0f) phi += 2.0f * kPi;
-    u = phi / (2.0f * kPi);
-    v = 1.0f - theta / kPi;
-    return true;
+    return rayToEquirectUV(params_.invMVP, ndcX, ndcY, u, v);
   }
 
   bool cylinderUV(float ndcX, float ndcY, float &u, float &v) const {
@@ -398,6 +244,8 @@ class ReframePlugin : public OFX::ImageEffect {
   OFX::DoubleParam *panParam() const { return pan_; }
   OFX::DoubleParam *tiltParam() const { return tilt_; }
   OFX::DoubleParam *fovParam() const { return fov_; }
+  OFX::DoubleParam *srcPitchParam() const { return srcPitch_; }
+  OFX::DoubleParam *srcRollParam() const { return srcRoll_; }
 
   void render(const OFX::RenderArguments &args) override {
     std::unique_ptr<OFX::Image> dst(dstClip_->fetchImage(args.time));
@@ -418,7 +266,7 @@ class ReframePlugin : public OFX::ImageEffect {
     proc.setDstImg(dst.get());
     proc.setSrcImg(src.get());
     proc.setRenderWindow(args.renderWindow);
-    proc.setParams(buildParams(args, dst->getBounds()));
+    proc.setParams(buildParams(args.time, dst->getBounds(), src->getBounds()));
     proc.process();
   }
 
@@ -470,7 +318,7 @@ class ReframePlugin : public OFX::ImageEffect {
     const int dstW = db.x2 - db.x1, dstH = db.y2 - db.y1;
     if (srcW < 2 || srcH < 2 || dstW < 1 || dstH < 1) return false;
 
-    const RenderParams p = buildParams(args, db);
+    const RenderParams p = buildParams(args.time, db, sb);
     ReframeCLParams cl{};
     std::memcpy(cl.invMVP, p.invMVP.m, sizeof(cl.invMVP));
     std::memcpy(cl.rot3, p.rot3, sizeof(cl.rot3));
@@ -485,34 +333,55 @@ class ReframePlugin : public OFX::ImageEffect {
                             dst->getPixelData(), srcW, srcH, dstW, dstH, cl);
   }
 
-  RenderParams buildParams(const OFX::RenderArguments &args,
-                           const OfxRectI &dstBounds) const {
+  // Resolve pads the source to the timeline frame, so a 2:1 equirect on a 16:9
+  // timeline arrives letterboxed. Sampling the full height would pull the black
+  // bars into the poles, so remap v onto the pano band.
+  struct PanoFit {
+    float vScale = 1.0f, vOffset = 0.0f;
+  };
+
+  static PanoFit fitPanoToSource(const OfxRectI &srcBounds) {
+    PanoFit f;
+    const float w = static_cast<float>(srcBounds.x2 - srcBounds.x1);
+    const float h = static_cast<float>(srcBounds.y2 - srcBounds.y1);
+    if (w <= 0.0f || h <= 0.0f) return f;
+    const float panoH = w * 0.5f;
+    if (panoH >= h - 1.0f) return f;
+    f.vScale = panoH / h;
+    f.vOffset = (1.0f - f.vScale) * 0.5f;
+    return f;
+  }
+
+  RenderParams buildParams(double time, const OfxRectI &dstBounds,
+                           const OfxRectI &srcBounds) const {
     RenderParams p{};
     int projIdx = 0, borderIdx = 0;
-    projection_->getValueAtTime(args.time, projIdx);
-    borderMode_->getValueAtTime(args.time, borderIdx);
+    projection_->getValueAtTime(time, projIdx);
+    borderMode_->getValueAtTime(time, borderIdx);
     p.projection = static_cast<Projection>(projIdx);
     p.borderMode = static_cast<BorderMode>(borderIdx);
     double br, bg, bb;
-    borderColor_->getValueAtTime(args.time, br, bg, bb);
+    borderColor_->getValueAtTime(time, br, bg, bb);
     p.borderRGB[0] = static_cast<float>(br);
     p.borderRGB[1] = static_cast<float>(bg);
     p.borderRGB[2] = static_cast<float>(bb);
-    p.vScale = 1.0f;
-    p.vOffset = 0.0f;
+    const PanoFit fit = fitPanoToSource(srcBounds);
+    p.vScale = fit.vScale;
+    p.vOffset = fit.vOffset;
 
     const float deg = kPi / 180.0f;
-    const float pan = static_cast<float>(pan_->getValueAtTime(args.time)) * deg;
-    const float tilt = static_cast<float>(tilt_->getValueAtTime(args.time)) * deg;
-    const float roll = static_cast<float>(roll_->getValueAtTime(args.time)) * deg;
-    const float sYaw = static_cast<float>(srcYaw_->getValueAtTime(args.time)) * deg;
-    const float sPitch = static_cast<float>(srcPitch_->getValueAtTime(args.time)) * deg;
-    const float sRoll = static_cast<float>(srcRoll_->getValueAtTime(args.time)) * deg;
-    const float fovDeg = static_cast<float>(fov_->getValueAtTime(args.time));
-    const float distortion = static_cast<float>(distortion_->getValueAtTime(args.time));
+    const float pan = static_cast<float>(pan_->getValueAtTime(time)) * deg;
+    const float tilt = static_cast<float>(tilt_->getValueAtTime(time)) * deg;
+    const float roll = static_cast<float>(roll_->getValueAtTime(time)) * deg;
+    const float sYaw = static_cast<float>(srcYaw_->getValueAtTime(time)) * deg;
+    const float sPitch = static_cast<float>(srcPitch_->getValueAtTime(time)) * deg;
+    const float sRoll = static_cast<float>(srcRoll_->getValueAtTime(time)) * deg;
+    const float fovDeg = static_cast<float>(fov_->getValueAtTime(time));
+    const float distortion = static_cast<float>(distortion_->getValueAtTime(time));
 
     const Mat4 srcFix =
         multiply(multiply(rotationY(sYaw), rotationX(sPitch)), rotationZ(sRoll));
+
     const Mat4 view =
         multiply(multiply(rotationZ(roll), rotationX(tilt)), rotationY(pan));
     const Mat4 orient = multiply(view, srcFix);
@@ -550,7 +419,7 @@ class ReframePlugin : public OFX::ImageEffect {
     const float dstH = static_cast<float>(dstBounds.y2 - dstBounds.y1);
     float vpW = dstW, vpH = dstH;
     int targetW = 0, targetH = 0;
-    if (outputSize(args.time, targetW, targetH) && targetW > 0 && targetH > 0) {
+    if (outputSize(time, targetW, targetH) && targetW > 0 && targetH > 0) {
       const float target = static_cast<float>(targetW) / static_cast<float>(targetH);
       if (dstW / dstH > target)
         vpW = dstH * target;
@@ -634,6 +503,7 @@ class ReframeOverlay : public OFX::OverlayInteract {
     glVertex2d(cx, cy - s);
     glVertex2d(cx, cy + s);
     glEnd();
+
     glDisable(GL_BLEND);
     return true;
   }
@@ -658,10 +528,20 @@ class ReframeOverlay : public OFX::OverlayInteract {
     const double dy = (args.penPosition.y - last_.y) / h * fov;
     last_ = args.penPosition;
 
+    // The source orientation rotates the rendered view, so the raw drag delta
+    // no longer matches screen axes (a 180 source rotate inverts both).
+    const double deg = 3.14159265358979323846 / 180.0;
+    double a = plugin_->srcRollParam()->getValueAtTime(args.time) * deg;
+    if (std::cos(plugin_->srcPitchParam()->getValueAtTime(args.time) * deg) < 0.0)
+      a += 3.14159265358979323846;
+    const double ca = std::cos(a), sa = std::sin(a);
+    const double rdx = dx * ca + dy * sa;
+    const double rdy = dy;
+
     plugin_->panParam()->setValue(
-        plugin_->panParam()->getValueAtTime(args.time) - dx);
+        plugin_->panParam()->getValueAtTime(args.time) - rdx);
     plugin_->tiltParam()->setValue(std::clamp(
-        plugin_->tiltParam()->getValueAtTime(args.time) + dy, -90.0, 90.0));
+        plugin_->tiltParam()->getValueAtTime(args.time) + rdy, -90.0, 90.0));
     return true;
   }
 

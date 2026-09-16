@@ -12,6 +12,10 @@ projection maths, not a binary wrapper.
 Plugin identifier and version match the original (`com.pano360.reframe` 1.0), so projects
 moved between platforms keep their node links.
 
+Scope is the original feature set, nothing added. The only deltas are Linux fixes:
+letterboxed sources are detected instead of sampling black bars into the poles, and
+viewer dragging stays aligned when the source orientation is rotated.
+
 ## Build
 
 ```
@@ -35,7 +39,9 @@ Alternatively point `OFX_PLUGIN_PATH` at `build/`.
 
 ## Input format
 
-The source clip must be **equirectangular** (2:1). Raw Osmo 360 `.OSV` files are two
+The source clip must be **equirectangular** (2:1). If the host pads it into a taller
+frame (a 2:1 clip on a 16:9 timeline), the padding is detected from the source bounds
+and excluded, otherwise the black bars get sampled into the poles. Raw Osmo 360 `.OSV` files are two
 3000x3000 fisheye HEVC streams in one MP4 and must be stitched by DJI Studio first, on
 Windows or macOS, or by the Mimo app. That step is unrelated to this plugin and is
 required on Windows too.
